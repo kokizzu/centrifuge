@@ -62,12 +62,19 @@ var (
 // makeSignature creates an HMAC-SHA256 track signature.
 //
 // Signature format: "issuedAt:expireAt:role:hmacHex"
-// HMAC payload: "issuedAt:expireAt:role:channel:sha256(sorted_keys)"
+// HMAC payload: "issuedAt\0expireAt\0role\0channel\0sha256(sorted_keys)"
 //
 // The signature binds together: time window, role, channel, and exact set of keys.
 // Changing any of these invalidates the HMAC. The role is embedded in the signature
 // so the server can extract it during verification without needing to look up the
 // connection's role separately.
+//
+// Inner payload fields are NUL-separated (matching Centrifugo's standard track
+// signature format) so colons inside role or channel can't shift between fields
+// and yield a colliding HMAC for a different (role, channel) tuple. The outer
+// signature string itself stays ':'-separated because its non-role fields are
+// colon-free by construction; role here is constrained to {"admin","viewer"}
+// so it's safe to keep in the outer string.
 func makeSignature(ch string, keys []string, role string, ttl int) string {
 	now := time.Now().Unix()
 	expireAt := now + int64(ttl)
@@ -75,7 +82,7 @@ func makeSignature(ch string, keys []string, role string, ttl int) string {
 	copy(sorted, keys)
 	sort.Strings(sorted)
 	keysHash := sha256.Sum256([]byte(strings.Join(sorted, "\x00")))
-	payload := fmt.Sprintf("%d:%d:%s:%s:%x", now, expireAt, role, ch, keysHash)
+	payload := fmt.Sprintf("%d\x00%d\x00%s\x00%s\x00%x", now, expireAt, role, ch, keysHash)
 	mac := hmac.New(sha256.New, []byte(signatureSecret))
 	mac.Write([]byte(payload))
 	return fmt.Sprintf("%d:%d:%s:%x", now, expireAt, role, mac.Sum(nil))
@@ -102,12 +109,13 @@ func verifySignature(sig, ch string, keys []string) (role string, expireAt int64
 		return "", 0, errors.New("signature expired")
 	}
 
-	// Reconstruct the expected HMAC from the claimed parameters.
+	// Reconstruct the expected HMAC from the claimed parameters. Must mirror
+	// the NUL-separated payload built in makeSignature.
 	sorted := make([]string, len(keys))
 	copy(sorted, keys)
 	sort.Strings(sorted)
 	keysHash := sha256.Sum256([]byte(strings.Join(sorted, "\x00")))
-	payload := fmt.Sprintf("%d:%d:%s:%s:%x", issuedAt, expireAt, role, ch, keysHash)
+	payload := fmt.Sprintf("%d\x00%d\x00%s\x00%s\x00%x", issuedAt, expireAt, role, ch, keysHash)
 	mac := hmac.New(sha256.New, []byte(signatureSecret))
 	mac.Write([]byte(payload))
 	expectedMAC := fmt.Sprintf("%x", mac.Sum(nil))
@@ -214,46 +222,57 @@ func main() {
 		})
 
 		// OnTrack is the SOLE authorization gate for shared poll subscriptions.
-		// The handler MUST verify the signature — returning nil error without
-		// validation lets any client subscribe to arbitrary keys.
+		// The handler MUST verify every batch's signature — returning nil error
+		// without validation lets any client subscribe to arbitrary keys.
+		//
+		// A single track request can carry multiple signed batches (the SDK
+		// replays its cached signature library after reconnect). We verify each
+		// batch independently and reject the whole request on any failure.
 		client.OnTrack(func(e centrifuge.TrackEvent, cb centrifuge.TrackCallback) {
-			keys := make([]string, len(e.Items))
-			for i, item := range e.Items {
-				keys[i] = item.Key
-			}
+			batchReplies := make([]centrifuge.TrackBatchReply, len(e.Batches))
+			totalKeys := 0
+			for i, b := range e.Batches {
+				keys := make([]string, len(b.Items))
+				for j, item := range b.Items {
+					keys[j] = item.Key
+				}
 
-			// Step 1: Verify HMAC signature — proves the backend authorized
-			// this exact set of keys for the embedded role.
-			role, expireAt, err := verifySignature(e.Signature, e.Channel, keys)
-			if err != nil {
-				log.Printf("[user %s] track rejected: %v", client.UserID(), err)
-				cb(centrifuge.TrackReply{}, centrifuge.ErrorPermissionDenied)
-				return
-			}
-
-			// Step 2: Defense-in-depth — verify each key is accessible by the
-			// role extracted from the (already-verified) signature. This catches
-			// bugs where the signature-issuing endpoint accidentally includes
-			// keys the role shouldn't see.
-			flagsMu.RLock()
-			for _, item := range e.Items {
-				f, ok := flags[item.Key]
-				if ok && f.AdminOnly && role != "admin" {
-					flagsMu.RUnlock()
-					log.Printf("[user %s] track rejected: %s requires admin role", client.UserID(), item.Key)
+				// Step 1: verify HMAC signature for this batch — proves the
+				// backend authorized this exact set of keys for the embedded role.
+				role, expireAt, err := verifySignature(b.Signature, e.Channel, keys)
+				if err != nil {
+					log.Printf("[user %s] track rejected: %v", client.UserID(), err)
 					cb(centrifuge.TrackReply{}, centrifuge.ErrorPermissionDenied)
 					return
 				}
+
+				// Step 2: defense-in-depth — verify each key is accessible by the
+				// role extracted from the (already-verified) signature. This catches
+				// bugs where the signature-issuing endpoint accidentally includes
+				// keys the role shouldn't see.
+				flagsMu.RLock()
+				for _, item := range b.Items {
+					f, ok := flags[item.Key]
+					if ok && f.AdminOnly && role != "admin" {
+						flagsMu.RUnlock()
+						log.Printf("[user %s] track rejected: %s requires admin role", client.UserID(), item.Key)
+						cb(centrifuge.TrackReply{}, centrifuge.ErrorPermissionDenied)
+						return
+					}
+				}
+				flagsMu.RUnlock()
+
+				batchReplies[i] = centrifuge.TrackBatchReply{ExpireAt: expireAt}
+				totalKeys += len(keys)
 			}
-			flagsMu.RUnlock()
 
-			log.Printf("[user %s] track approved: %d keys, role=%s", client.UserID(), len(keys), role)
+			log.Printf("[user %s] track approved: %d keys across %d batch(es)", client.UserID(), totalKeys, len(e.Batches))
 
-			// ExpireAt forces the client to re-authorize after the signature TTL.
-			// This is how you enforce access revocation: when the client re-tracks
-			// with a fresh signature, the backend can refuse to sign keys the user
-			// no longer has access to.
-			cb(centrifuge.TrackReply{ExpireAt: expireAt}, nil)
+			// Per-batch ExpireAt forces the client to re-authorize each batch
+			// independently after its signature TTL. This is how you enforce
+			// access revocation: when the client re-tracks with a fresh signature,
+			// the backend can refuse to sign keys the user no longer has access to.
+			cb(centrifuge.TrackReply{Batches: batchReplies}, nil)
 		})
 
 		client.OnDisconnect(func(e centrifuge.DisconnectEvent) {
