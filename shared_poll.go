@@ -16,6 +16,14 @@ import (
 	fdelta "github.com/shadowspore/fossil-delta"
 )
 
+// notifChCapacity bounds the per-channel notification queue used by
+// SharedPollManager.notify. Each entry is one tracked-key notification waiting
+// to be batched into the next backend poll. Sized to absorb typical bursts
+// (large reconnect waves, cache-invalidation storms). When the buffer is full,
+// extra notifications are dropped and counted by the droppedNotifyCount metric
+// — the next timer-based poll cycle covers anything that was lost.
+const notifChCapacity = 4096
+
 // SharedPollManager manages all shared poll channels for a Node.
 // One instance per Node. Thread-safe.
 type SharedPollManager struct {
@@ -51,7 +59,10 @@ type sharedPollChannelState struct {
 	versionCounter uint64
 
 	// notifCh receives individual key notifications from SharedPollNotify.
-	// Buffered, non-blocking send — drops if full.
+	// Buffered, non-blocking send — drops if full and increments the
+	// droppedNotifyCount metric. Capacity is sized for typical bursts; under
+	// extreme load drops are surfaced via the metric and the next timer-based
+	// poll closes the gap.
 	notifCh chan string
 
 	// refreshWorker lifecycle.
@@ -132,7 +143,7 @@ func (m *SharedPollManager) track(channel string, opts SharedPollChannelOptions,
 			opts:      opts,
 			epoch:     initialChannelEpoch(opts),
 			itemIndex: make(map[string]*sharedPollTrackedEntry),
-			notifCh:   make(chan string, 1024),
+			notifCh:   make(chan string, notifChCapacity),
 		}
 		m.channels[channel] = s
 	}
@@ -155,7 +166,7 @@ func (m *SharedPollManager) track(channel string, opts SharedPollChannelOptions,
 			opts:      opts,
 			epoch:     initialChannelEpoch(opts),
 			itemIndex: make(map[string]*sharedPollTrackedEntry),
-			notifCh:   make(chan string, 1024),
+			notifCh:   make(chan string, notifChCapacity),
 		}
 		m.channels[channel] = s
 		m.mu.Unlock()
@@ -256,7 +267,7 @@ func (m *SharedPollManager) trackKeys(channel string, opts SharedPollChannelOpti
 			opts:      opts,
 			epoch:     initialChannelEpoch(opts),
 			itemIndex: make(map[string]*sharedPollTrackedEntry),
-			notifCh:   make(chan string, 1024),
+			notifCh:   make(chan string, notifChCapacity),
 		}
 		m.channels[channel] = s
 	}
@@ -279,7 +290,7 @@ func (m *SharedPollManager) trackKeys(channel string, opts SharedPollChannelOpti
 			opts:      opts,
 			epoch:     initialChannelEpoch(opts),
 			itemIndex: make(map[string]*sharedPollTrackedEntry),
-			notifCh:   make(chan string, 1024),
+			notifCh:   make(chan string, notifChCapacity),
 		}
 		m.channels[channel] = s
 		m.mu.Unlock()
