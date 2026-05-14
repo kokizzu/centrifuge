@@ -3868,6 +3868,16 @@ func TestSharedPollEpoch_FlipResetsEntries(t *testing.T) {
 	subscribeSharedPollClient(t, client, "test:channel")
 	trackSharedPollClient(t, client, "test:channel", []*protocol.KeyedItem{{Key: "k1", Version: 0}})
 
+	// track() triggers a cold-key auto-poll that reads the publisher epoch
+	// atomic synchronously but applies the response asynchronously. Wait for
+	// that poll to flip the channel epoch to "epochA" before changing the
+	// publisher epoch — otherwise an in-flight response carrying the old
+	// "epochA" can land after the publish below flips to "epochB" and
+	// flip the state back, breaking the test.
+	require.Eventually(t, func() bool {
+		return node.sharedPollManager.Epoch("test:channel", false) == "epochA"
+	}, time.Second, 10*time.Millisecond)
+
 	ctx := context.Background()
 	require.NoError(t, node.SharedPollPublish(ctx, "test:channel", "k1", 1000, "epochA", []byte(`{"v":1000}`)))
 
