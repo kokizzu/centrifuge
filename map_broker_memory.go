@@ -520,10 +520,13 @@ func (h *mapHub) removeChannels() {
 	}
 }
 
-// expiredKeyEvent holds data for publishing removal events after lock is released.
+// expiredKeyEvent holds a Phase 1 snapshot of an expired key candidate. Phase 2
+// re-validates the entry under pubLock(ch) → hub lock before deleting state and
+// appending the removal to the stream atomically.
 type expiredKeyEvent struct {
 	channel    string
 	key        string
+	expireAt   int64
 	tags       map[string]string
 	streamSize int
 }
@@ -547,13 +550,17 @@ func (h *mapHub) expireKeys() {
 }
 
 func (h *mapHub) expireKeysIteration(nextKeyExpireCheck *int64) {
-	// Phase 1: Under hub lock — collect expired keys and remove from state.
-	// Stream.Add is deferred to phase 2 (under pubLock) to maintain lock ordering
-	// consistent with Publish: pubLock → hub lock (prevents potential deadlock).
+	// Phase 1: Under hub lock — collect expired key candidates only. State is NOT
+	// mutated here. Mutating state in Phase 1 without holding pubLock(ch) would
+	// expose subscribers to an inconsistent ReadState→ReadStream window where the
+	// key is gone from state but the corresponding removal event is not yet on the
+	// stream — they would later receive a removal for a key they never saw. Phase 2
+	// acquires pubLock(ch) → hub lock per channel and atomically deletes state +
+	// appends the removal to the stream + invokes the handler, matching the lock
+	// ordering and atomicity of Remove() and Publish().
 	var expiredEvents []expiredKeyEvent
 	var eventHandler BrokerEventHandler
 	var oldestExpireAt int64 // Track oldest expired timestamp for lag metric.
-	var keysRemoved int64    // Track total keys removed (independent of eventHandler).
 
 	h.Lock()
 	if h.nextKeyExpireCheck == 0 || h.nextKeyExpireCheck > time.Now().UnixMilli() {
@@ -620,30 +627,20 @@ func (h *mapHub) expireKeysIteration(nextKeyExpireCheck *int64) {
 			oldestExpireAt = expireAt
 		}
 
-		// Remove the expired key from state (stream.Add deferred to phase 2).
-		delete(channel.state, key)
-		delete(h.keyExpires, chKey)
-		keysRemoved++
-		channel.sortedKeysDirty = true
-		if channel.ordered {
-			delete(channel.scores, key)
-		}
-
-		if eventHandler != nil {
-			var streamSize int
-			if h.channelOptionsResolver != nil {
-				chOpts, err := ResolveAndValidateMapChannelOptions(h.channelOptionsResolver, ch)
-				if err == nil && chOpts.Mode.HasStream() {
-					streamSize = chOpts.StreamSize
-				}
+		var streamSize int
+		if h.channelOptionsResolver != nil {
+			chOpts, err := ResolveAndValidateMapChannelOptions(h.channelOptionsResolver, ch)
+			if err == nil && chOpts.Mode.HasStream() {
+				streamSize = chOpts.StreamSize
 			}
-			expiredEvents = append(expiredEvents, expiredKeyEvent{
-				channel:    ch,
-				key:        key,
-				tags:       entry.Publication.Tags,
-				streamSize: streamSize,
-			})
 		}
+		expiredEvents = append(expiredEvents, expiredKeyEvent{
+			channel:    ch,
+			key:        key,
+			expireAt:   expireAt,
+			tags:       entry.Publication.Tags,
+			streamSize: streamSize,
+		})
 	}
 	// Compact heap when stale entries exceed 2x live entries.
 	// Stale entries accumulate from TTL refreshes that push new items without
@@ -665,7 +662,7 @@ func (h *mapHub) expireKeysIteration(nextKeyExpireCheck *int64) {
 	h.nextKeyExpireCheck = *nextKeyExpireCheck
 	h.Unlock()
 
-	// Report cleanup metrics outside the lock.
+	// Report cleanup lag metric outside the lock.
 	if h.node != nil && h.node.metrics != nil {
 		if oldestExpireAt > 0 {
 			lagSeconds := float64(now-oldestExpireAt) / 1000.0
@@ -676,13 +673,12 @@ func (h *mapHub) expireKeysIteration(nextKeyExpireCheck *int64) {
 		} else {
 			h.node.metrics.setMapBrokerCleanupLag("", 0)
 		}
-		if keysRemoved > 0 {
-			h.node.metrics.addMapBrokerCleanupKeysRemoved("", keysRemoved)
-		}
 	}
 
-	// Phase 2: Under pubLock → hub lock — add to stream and deliver events.
-	// This matches Publish's lock ordering: pubLock → hub lock → HandlePublication.
+	// Phase 2: Under pubLock(ch) → hub lock — delete state, append removal stream
+	// entry, and dispatch the event atomically per channel. Re-validate the entry
+	// to handle refreshes or removals that landed after the Phase 1 snapshot.
+	var keysRemoved int64
 	for _, event := range expiredEvents {
 		var mu *sync.Mutex
 		if h.pubLocks != nil {
@@ -697,41 +693,59 @@ func (h *mapHub) expireKeysIteration(nextKeyExpireCheck *int64) {
 			Tags:    event.tags,
 		}
 		var streamPos StreamPosition
+		var dispatch bool
 
 		h.Lock()
 		channel, ok := h.channels[event.channel]
 		if ok {
-			// Check if the key was re-added between Phase 1 and Phase 2.
-			// A concurrent Publish may have re-inserted the key into state.
-			if _, keyExists := channel.state[event.key]; keyExists {
-				h.Unlock()
-				if mu != nil {
-					mu.Unlock()
+			entry, exists := channel.state[event.key]
+			chKey := h.makeChKey(event.channel, event.key)
+			if exists && entry.ExpireAt == event.expireAt {
+				// Still expired with the same deadline — delete state and stream-append atomically.
+				delete(channel.state, event.key)
+				delete(h.keyExpires, chKey)
+				keysRemoved++
+				channel.sortedKeysDirty = true
+				if channel.ordered {
+					delete(channel.scores, event.key)
 				}
-				continue
-			}
-			if channel.stream != nil {
-				if event.streamSize > 0 {
-					offset, _ := channel.stream.Add(removePub, event.streamSize, 0, "")
-					removePub.Offset = offset
-					streamPos = StreamPosition{Offset: offset, Epoch: channel.stream.Epoch()}
-				} else {
-					streamPos = StreamPosition{Offset: channel.stream.Top(), Epoch: channel.stream.Epoch()}
+				if channel.stream != nil {
+					if event.streamSize > 0 {
+						offset, _ := channel.stream.Add(removePub, event.streamSize, 0, "")
+						removePub.Offset = offset
+						streamPos = StreamPosition{Offset: offset, Epoch: channel.stream.Epoch()}
+					} else {
+						streamPos = StreamPosition{Offset: channel.stream.Top(), Epoch: channel.stream.Epoch()}
+					}
+				}
+				dispatch = eventHandler != nil
+			} else if exists && entry.ExpireAt > now {
+				// Entry was refreshed between Phase 1 and Phase 2 — re-queue.
+				h.keyExpires[chKey] = entry.ExpireAt
+				heap.Push(&h.keyExpireQueue, &priority.Item{Value: chKey, Priority: entry.ExpireAt})
+				if h.nextKeyExpireCheck == 0 || entry.ExpireAt < h.nextKeyExpireCheck {
+					h.nextKeyExpireCheck = entry.ExpireAt
 				}
 			}
 		}
 		h.Unlock()
 
-		err := eventHandler.HandlePublication(event.channel, removePub, streamPos, false, nil)
+		if dispatch {
+			err := eventHandler.HandlePublication(event.channel, removePub, streamPos, false, nil)
+			if err != nil && h.node != nil {
+				h.node.logger.log(newErrorLogEntry(err, "error handling expired key publication", map[string]any{"channel": event.channel, "key": event.key}))
+				if h.node.metrics != nil {
+					h.node.metrics.incMapBrokerCleanupErrors("")
+				}
+			}
+		}
 		if mu != nil {
 			mu.Unlock()
 		}
-		if err != nil {
-			h.node.logger.log(newErrorLogEntry(err, "error handling expired key publication", map[string]any{"channel": event.channel, "key": event.key}))
-			if h.node.metrics != nil {
-				h.node.metrics.incMapBrokerCleanupErrors("")
-			}
-		}
+	}
+
+	if h.node != nil && h.node.metrics != nil && keysRemoved > 0 {
+		h.node.metrics.addMapBrokerCleanupKeysRemoved("", keysRemoved)
 	}
 }
 

@@ -288,6 +288,15 @@ func (c *Client) handleTrack(req *protocol.SubRefreshRequest, cmd *protocol.Comm
 
 		// Step 3: Update per-connection versions for cached items to prevent
 		// duplicate delivery via subsequent broadcasts.
+		// Capture (keyState, prevVersion, prevDeltaReady) so we can roll back
+		// if the response encode fails below — without rollback the connection
+		// would mark cached items as delivered while the SDK never received them.
+		type versionRollback struct {
+			ks              *keyedKeyState
+			prevVersion     uint64
+			prevDeltaReady  bool
+		}
+		var rollbacks []versionRollback
 		if len(cachedItems) > 0 {
 			c.mu.Lock()
 			if c.keyed != nil {
@@ -295,6 +304,7 @@ func (c *Client) handleTrack(req *protocol.SubRefreshRequest, cmd *protocol.Comm
 				for _, pub := range cachedItems {
 					if ks, ok := chanKeys[pub.Key]; ok {
 						if pub.Version > ks.version {
+							rollbacks = append(rollbacks, versionRollback{ks: ks, prevVersion: ks.version, prevDeltaReady: ks.deltaReady})
 							ks.version = pub.Version
 							ks.deltaReady = true
 						}
@@ -323,6 +333,18 @@ func (c *Client) handleTrack(req *protocol.SubRefreshRequest, cmd *protocol.Comm
 
 		protoReply, err := c.getSubRefreshCommandReply(res)
 		if err != nil {
+			// Roll back per-connection version updates from Step 3 — the SDK
+			// never received the reply, so we must not pretend it has the
+			// cached versions. Without this, the next live broadcast at the
+			// same version is filtered out and the client misses a publication.
+			if len(rollbacks) > 0 {
+				c.mu.Lock()
+				for _, r := range rollbacks {
+					r.ks.version = r.prevVersion
+					r.ks.deltaReady = r.prevDeltaReady
+				}
+				c.mu.Unlock()
+			}
 			c.logWriteInternalErrorFlush(channel, protocol.FrameTypeSubRefresh, cmd, err, "error encoding sub refresh", started, rw)
 			return
 		}

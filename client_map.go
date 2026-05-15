@@ -647,7 +647,15 @@ func (c *Client) handleMapTransitionToLive(
 		// If recovering and the epoch doesn't match, force full re-subscribe.
 		// This covers: empty→real (client never had epoch), real→empty (after MapClear
 		// deleted meta row), and real→different (after Clear + new publications).
-		if params.isRecovery && params.sincePosition.Epoch != streamPos.Epoch {
+		//
+		// For state→live (isRecovery=false), params.sincePosition.Epoch is the
+		// epoch returned by the broker during the state phase. A mismatch here
+		// means the broker flipped epochs between state and stream reads (e.g.
+		// MapClear or meta-TTL eviction landed in between); without this check
+		// the client would merge the prior-epoch state with new-epoch live pubs
+		// and silently lose any keys not republished. The `!= ""` guard keeps
+		// ephemeral-mode subscribes (which have no epoch) working.
+		if (params.isRecovery || params.sincePosition.Epoch != "") && params.sincePosition.Epoch != streamPos.Epoch {
 			c.pubSubSync.StopBuffering(channel)
 			_ = c.node.removeSubscription(channel, c)
 			c.cleanupMapSubscribing(channel)
@@ -775,7 +783,8 @@ func (c *Client) handleMapTransitionToLive(
 		res.Id = chanID
 	}
 
-	// Write response before stopping buffer.
+	// Encode reply first so an encode failure is surfaced before we touch
+	// c.channels — keeps the rollback path simple.
 	protoReply, err := c.getSubscribeCommandReply(res)
 	if err != nil {
 		c.pubSubSync.StopBuffering(channel)
@@ -785,15 +794,6 @@ func (c *Client) handleMapTransitionToLive(
 			"channel": channel, "user": c.user, "client": c.uid,
 		}))
 		return ErrorInternal
-	}
-
-	c.writeEncodedCommandReply(channel, protocol.FrameTypeSubscribe, cmd, protoReply, rw)
-	c.handleCommandFinished(cmd, protocol.FrameTypeSubscribe, nil, protoReply, started, "")
-	c.releaseSubscribeCommandReply(protoReply)
-	c.node.metrics.incActionCount(params.metricsAction, channel)
-	if params.isRecovery && req.Recover {
-		c.node.metrics.incRecover(true, channel, len(recoveredPubs) > 0)
-		c.node.metrics.observeRecoveredPublications(len(recoveredPubs), channel)
 	}
 
 	// Build channel context with map flag.
@@ -814,16 +814,43 @@ func (c *Client) handleMapTransitionToLive(
 		mapUserPresenceChannel:   opts.MapUserPresenceChannel,
 	}
 
+	// Install channelContext BEFORE writing the reply so that any follow-up
+	// commands from the SDK that arrive between the reply send and StopBuffering
+	// observe the channel as subscribed. Buffered PUB/SUB publications stay
+	// queued until StopBuffering below — they cannot reach the client yet.
 	// Move from mapSubscribing to channels. Always look up from the map under
 	// the lock to avoid closing a subscribingCh that was already closed by a
 	// concurrent disconnect handler (cleanupMapSubscribingAll).
+	//
+	// Re-check c.status under the lock — Client.close() may have run between
+	// addSubscription and here. If it has, c.channels was snapshotted before our
+	// entry existed (so close() did NOT remove our hub subscription), and
+	// cleanupMapSubscribingAll dropped the mapSubscribing entry. Writing
+	// channelContext now would leave a ghost subscription in the hub with no
+	// cleanup path. Roll back instead. Mirrors the pattern in subscribeCmd.
 	c.mu.Lock()
+	if c.status == statusClosed {
+		c.mu.Unlock()
+		_ = c.node.removeSubscription(channel, c)
+		c.releaseSubscribeCommandReply(protoReply)
+		c.pubSubSync.StopBuffering(channel)
+		return ErrorInternal
+	}
 	if st, ok := c.mapSubscribing[channel]; ok && st.subscribingCh != nil {
 		close(st.subscribingCh)
 	}
 	delete(c.mapSubscribing, channel)
 	c.channels[channel] = channelContext
 	c.mu.Unlock()
+
+	c.writeEncodedCommandReply(channel, protocol.FrameTypeSubscribe, cmd, protoReply, rw)
+	c.handleCommandFinished(cmd, protocol.FrameTypeSubscribe, nil, protoReply, started, "")
+	c.releaseSubscribeCommandReply(protoReply)
+	c.node.metrics.incActionCount(params.metricsAction, channel)
+	if params.isRecovery && req.Recover {
+		c.node.metrics.incRecover(true, channel, len(recoveredPubs) > 0)
+		c.node.metrics.observeRecoveredPublications(len(recoveredPubs), channel)
+	}
 
 	// Stop buffering after response written.
 	c.pubSubSync.StopBuffering(channel)
@@ -1302,23 +1329,55 @@ func (c *Client) releaseMapPaginationLock(channel string) {
 // command — O(n) where n is in-progress catch-ups (typically 0–2), no-op when map
 // is empty.
 func (c *Client) sweepExpiredMapSubscribing(skipChannel string) {
+	// Snapshot under read lock so we can resolve channel options without holding
+	// c.mu — resolveMapChannelOptions invokes a user-supplied callback and must
+	// not run under c.mu (deadlock / priority-inversion risk if the callback
+	// touches per-client state or external services).
 	c.mu.RLock()
 	n := len(c.mapSubscribing)
-	c.mu.RUnlock()
 	if n == 0 {
+		c.mu.RUnlock()
 		return
 	}
-	c.mu.Lock()
+	type sweepCandidate struct {
+		ch    string
+		state *mapSubscribeState
+	}
+	candidates := make([]sweepCandidate, 0, n)
 	for ch, state := range c.mapSubscribing {
 		if ch == skipChannel {
 			continue
 		}
-		sweepChOpts, _ := c.node.resolveMapChannelOptions(ch)
-		if c.isMapCatchUpExpired(state, sweepChOpts) {
+		candidates = append(candidates, sweepCandidate{ch: ch, state: state})
+	}
+	c.mu.RUnlock()
+
+	// Resolve options + check expiry outside any lock.
+	type sweepExpired struct {
+		ch    string
+		state *mapSubscribeState
+	}
+	var expired []sweepExpired
+	for _, cand := range candidates {
+		sweepChOpts, _ := c.node.resolveMapChannelOptions(cand.ch)
+		if c.isMapCatchUpExpired(cand.state, sweepChOpts) {
+			expired = append(expired, sweepExpired{ch: cand.ch, state: cand.state})
+		}
+	}
+	if len(expired) == 0 {
+		return
+	}
+
+	// Delete only entries whose *mapSubscribeState pointer still matches the
+	// snapshot — guards against a resubscribe that replaced the entry between
+	// the RUnlock and the Lock.
+	c.mu.Lock()
+	for _, e := range expired {
+		if state, ok := c.mapSubscribing[e.ch]; ok && state == e.state {
 			if state.subscribingCh != nil {
 				close(state.subscribingCh)
 			}
-			delete(c.mapSubscribing, ch)
+			delete(c.mapSubscribing, e.ch)
 		}
 	}
 	c.mu.Unlock()

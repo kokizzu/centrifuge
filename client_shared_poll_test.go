@@ -3755,12 +3755,33 @@ func setEpochAwareSharedPollHandler(node *Node, initial string) func(string) {
 
 // TestSharedPollEpoch_VersionedInitialEmpty: a versioned channel starts with
 // empty epoch. The first publish carrying a non-empty epoch flips state.
+//
+// The cold-key auto-poll triggered by track() runs the OnSharedPoll handler
+// asynchronously, then calls applyRefreshResponse which may flip the channel
+// epoch. If the handler captures the epoch BEFORE the test's publish but the
+// response processing runs AFTER, the stale-epoch response flips s.epoch back
+// — a flaky race inherent to setEpochAwareSharedPollHandler's lockstep model.
+//
+// To make the test deterministic, the handler blocks until the test releases
+// it AFTER the publish. The handler then captures the post-publish epoch and
+// applyRefreshResponse becomes a no-op flip (epochA → epochA).
 func TestSharedPollEpoch_VersionedInitialEmpty(t *testing.T) {
 	node := newTestNodeWithSharedPoll(t, versionedSharedPollOpts())
 	setupSharedPollHandlers(node)
-	// First poll returns empty epoch (matches initial state); after the
-	// publish flips the channel, the handler is updated in lockstep.
-	setPublisherEpoch := setEpochAwareSharedPollHandler(node, "")
+
+	var epoch atomic.Pointer[string]
+	initial := ""
+	epoch.Store(&initial)
+	released := make(chan struct{})
+	var pollOnce sync.Once
+	node.OnSharedPoll(func(ctx context.Context, event SharedPollEvent) (SharedPollResult, error) {
+		// Only the first handler call (the cold-key auto-poll triggered by
+		// track) needs to block — any subsequent polls run unblocked.
+		pollOnce.Do(func() {
+			<-released
+		})
+		return SharedPollResult{Epoch: *epoch.Load()}, nil
+	})
 
 	client := newTestClientV2(t, node, "user1")
 	connectClientV2(t, client)
@@ -3771,9 +3792,15 @@ func TestSharedPollEpoch_VersionedInitialEmpty(t *testing.T) {
 	require.Equal(t, "", node.sharedPollManager.Epoch("test:channel", false))
 
 	// First publish with non-empty epoch sets the channel epoch.
-	setPublisherEpoch("epochA")
+	epochA := "epochA"
+	epoch.Store(&epochA)
 	err := node.SharedPollPublish(context.Background(), "test:channel", "k1", 1, "epochA", []byte(`{}`))
 	require.NoError(t, err)
+
+	// Release the auto-poll handler now that s.epoch has been set. The handler
+	// returns "epochA" and applyRefreshResponse's flipEpoch is a no-op.
+	close(released)
+
 	require.Eventually(t, func() bool {
 		return node.sharedPollManager.Epoch("test:channel", false) == "epochA"
 	}, time.Second, 10*time.Millisecond)

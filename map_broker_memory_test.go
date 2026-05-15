@@ -3814,26 +3814,27 @@ func TestMemoryMapBroker_RefreshTTLOnSuppress_RefreshesMetaTTL(t *testing.T) {
 	firstEpoch := res.Position.Epoch
 	require.NotEmpty(t, firstEpoch)
 
-	// Issue a suppressed keepalive every 100ms for 600ms — comfortably past
-	// the 300ms MetaTTL. With the fix the channel survives because each
-	// keepalive extends meta's removeAt; without it, removeChannels deletes
-	// the channel and the next publish creates a new epoch.
-	for i := 0; i < 6; i++ {
-		time.Sleep(100 * time.Millisecond)
-		res, err = broker.Publish(ctx, ch, "k", MapPublishOptions{
+	// Drive keepalives every 100ms via require.Eventually's tick — under -race
+	// this is more robust than a fixed time.Sleep loop, because each tick
+	// issues the keepalive AND verifies the channel is still alive in one
+	// step. With the fix, each suppressed keepalive extends meta's removeAt
+	// by 300ms; the assertion fails fast if the channel was reaped between
+	// ticks instead of silently passing.
+	keepaliveDeadline := time.Now().Add(600 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		res, err := broker.Publish(ctx, ch, "k", MapPublishOptions{
 			Data:                 []byte("v1"),
 			KeyMode:              KeyModeIfNew,
 			RefreshTTLOnSuppress: true,
 		})
 		require.NoError(t, err)
-		require.True(t, res.Suppressed, "iteration %d: expected key_exists suppression", i)
-	}
-
-	// Channel must still exist with the original epoch.
-	broker.mapHub.RLock()
-	_, exists := broker.mapHub.channels[ch]
-	broker.mapHub.RUnlock()
-	require.True(t, exists, "channel must survive while keepalives run")
+		require.True(t, res.Suppressed, "expected key_exists suppression")
+		broker.mapHub.RLock()
+		_, exists := broker.mapHub.channels[ch]
+		broker.mapHub.RUnlock()
+		require.True(t, exists, "channel must survive while keepalives run")
+		return time.Now().After(keepaliveDeadline)
+	}, 5*time.Second, 100*time.Millisecond)
 
 	// A real publish (non-suppressed) must use the same epoch — confirms no
 	// reset happened during the keepalive loop.

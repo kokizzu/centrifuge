@@ -4141,11 +4141,17 @@ func (c *Client) unsubscribe(channel string, unsubscribe Unsubscribe, disconnect
 				return nil
 			}
 		case <-time.After(maxWaitTimeout):
+			// Identity-match: only close/delete if the entry still corresponds to
+			// the *mapSubscribeState we were waiting on. A fresh resubscribe may
+			// have replaced it between the RUnlock and this Lock — clobbering
+			// that fresh entry would leak its subscribingCh waiters.
 			c.mu.Lock()
-			if state, exists := c.mapSubscribing[channel]; exists && state.subscribingCh != nil {
-				close(state.subscribingCh)
+			if state, exists := c.mapSubscribing[channel]; exists && state == keyedState {
+				if state.subscribingCh != nil {
+					close(state.subscribingCh)
+				}
+				delete(c.mapSubscribing, channel)
 			}
-			delete(c.mapSubscribing, channel)
 			c.mu.Unlock()
 			go func() {
 				_ = c.close(DisconnectServerError)
@@ -4163,12 +4169,15 @@ func (c *Client) unsubscribe(channel string, unsubscribe Unsubscribe, disconnect
 		}
 		delete(c.channels, channel)
 	}
-	// Clean up map subscribing state.
-	if state, exists := c.mapSubscribing[channel]; exists {
-		if state.subscribingCh != nil {
-			close(state.subscribingCh)
+	// Clean up map subscribing state. Identity-match against the snapshot so we
+	// don't close a fresh entry installed by a concurrent resubscribe.
+	if hasKeyedState {
+		if state, exists := c.mapSubscribing[channel]; exists && state == keyedState {
+			if state.subscribingCh != nil {
+				close(state.subscribingCh)
+			}
+			delete(c.mapSubscribing, channel)
 		}
-		delete(c.mapSubscribing, channel)
 	}
 	if disconnect == nil && c.perChannelWriter != nil {
 		c.perChannelWriter.delWriter(channel, false)

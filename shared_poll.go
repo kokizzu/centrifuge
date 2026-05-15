@@ -42,7 +42,14 @@ type SharedPollManager struct {
 }
 
 type sharedPollChannelState struct {
-	mu   sync.Mutex // protects all fields below
+	mu sync.Mutex // protects all fields below
+
+	// opts is captured at first track for this channel state and treated as
+	// immutable for the lifetime of the state. The refresh worker reads opts
+	// (RefreshInterval, batching, KeepLatestData, versioned/versionless mode, …)
+	// without re-resolving — runtime config changes via GetSharedPollChannelOptions
+	// only take effect after the channel state fully drains and is recreated
+	// (i.e., after all subscribers leave and the shutdown delay expires).
 	opts SharedPollChannelOptions
 
 	// epoch is a random string generated when this channel state is created.
@@ -482,10 +489,16 @@ func (m *SharedPollManager) markNeedsBroadcast(channel string, keys []string) {
 // notify sends a key notification to the channel's notification channel.
 // Non-blocking: drops the notification if the buffer is full.
 // Silently ignores unknown channels (channel must already be tracked).
+//
+// The read lock is held across the send so that a concurrent shutdown cannot
+// replace m.channels[channel] with a fresh state while we send into the now-
+// orphaned notifCh (whose worker has been cancelled and will never drain it).
+// The send is non-blocking (select with default) and the metric increments are
+// cheap, so holding the RLock here does not introduce contention.
 func (m *SharedPollManager) notify(channel string, key string) {
 	m.mu.RLock()
+	defer m.mu.RUnlock()
 	s, ok := m.channels[channel]
-	m.mu.RUnlock()
 	if !ok {
 		return
 	}
@@ -930,7 +943,6 @@ func (m *SharedPollManager) SharedPollRevokeKeys(channel string, keys []string, 
 // A zero delay means default (1s). Use a negative delay (e.g. -1) for immediate shutdown.
 func (s *sharedPollChannelState) scheduleShutdown(m *SharedPollManager, channel string, delay time.Duration) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if s.shutdownTimer != nil {
 		s.shutdownTimer.Stop()
@@ -941,8 +953,11 @@ func (s *sharedPollChannelState) scheduleShutdown(m *SharedPollManager, channel 
 	}
 
 	if delay < 0 {
-		// Immediate shutdown.
-		s.doShutdown(m, channel)
+		// Immediate shutdown: mirror the timer body. Release s.mu before
+		// touching m.mu — lock ordering is m.mu → s.mu everywhere.
+		s.doShutdownLocked(m, channel)
+		s.mu.Unlock()
+		s.finalizeShutdown(m, channel)
 		return
 	}
 
@@ -960,29 +975,28 @@ func (s *sharedPollChannelState) scheduleShutdown(m *SharedPollManager, channel 
 		}
 		s.doShutdownLocked(m, channel)
 		s.mu.Unlock()
-
-		m.mu.Lock()
-		if m.channels[channel] == s {
-			delete(m.channels, channel)
-			m.mu.Unlock()
-			m.node.keyedManager.removeChannel(channel)
-		} else {
-			m.mu.Unlock()
-		}
-		m.unsubscribeAllBrokerKeys(channel)
+		s.finalizeShutdown(m, channel)
 	})
+	s.mu.Unlock()
 }
 
-// doShutdown performs shutdown under s.mu. For immediate shutdown (no delay).
-func (s *sharedPollChannelState) doShutdown(m *SharedPollManager, channel string) {
+// doShutdownLocked marks the state as removed and cancels the worker. Caller
+// must hold s.mu and must not call any m.mu operation while holding s.mu —
+// lock ordering is m.mu → s.mu. The follow-up m.mu work is done in
+// finalizeShutdown after the caller releases s.mu.
+func (s *sharedPollChannelState) doShutdownLocked(m *SharedPollManager, channel string) {
 	if s.workerCancel != nil {
 		s.workerCancel()
 	}
 	s.removed = true
 	s.shutdownTimer = nil
-	// Release s.mu before acquiring m.mu (lock ordering).
-	s.mu.Unlock()
+}
 
+// finalizeShutdown removes the channel from the manager and unsubscribes broker
+// keys. Must be called with s.mu released (acquires m.mu and may call back into
+// keyedManager / dissolver). Safe to call when m.channels[channel] no longer
+// points to s — that branch is a no-op.
+func (s *sharedPollChannelState) finalizeShutdown(m *SharedPollManager, channel string) {
 	m.mu.Lock()
 	if m.channels[channel] == s {
 		delete(m.channels, channel)
@@ -992,18 +1006,6 @@ func (s *sharedPollChannelState) doShutdown(m *SharedPollManager, channel string
 		m.mu.Unlock()
 	}
 	m.unsubscribeAllBrokerKeys(channel)
-
-	// Re-acquire s.mu since caller expects it held (deferred unlock).
-	s.mu.Lock()
-}
-
-// doShutdownLocked performs shutdown steps under s.mu (for timer callback).
-func (s *sharedPollChannelState) doShutdownLocked(m *SharedPollManager, channel string) {
-	if s.workerCancel != nil {
-		s.workerCancel()
-	}
-	s.removed = true
-	s.shutdownTimer = nil
 }
 
 // cancelShutdown stops a pending shutdown timer. Caller must hold s.mu.
@@ -1279,11 +1281,23 @@ func (s *sharedPollChannelState) runRefreshCycle(ctx context.Context, node *Node
 	var wg sync.WaitGroup
 
 	for i, chunk := range chunks {
+		if ctx.Err() != nil {
+			break
+		}
 		if i > 0 && dispatchDelay > 0 {
+			// time.NewTimer + explicit Stop avoids leaking a timer per iteration
+			// when ctx is cancelled (time.After leaves the unselected timer to
+			// fire later, garbage-collected only after the duration elapses).
+			timer := time.NewTimer(dispatchDelay)
 			select {
 			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+			case <-timer.C:
+			}
+			if ctx.Err() != nil {
 				break
-			case <-time.After(dispatchDelay):
 			}
 		}
 
@@ -1382,161 +1396,28 @@ func buildPreparedPollData(pub *protocol.Publication, prevData []byte) preparedD
 	}
 }
 
-// onNotifiedRefreshResponse processes backend response for notified keys.
-// Unlike onRefreshResponse, it does not track absences since this is a targeted poll.
+// onNotifiedRefreshResponse processes a backend response triggered by a
+// notification (targeted poll). Identical to onRefreshResponse except for the
+// metric source label.
 func (s *sharedPollChannelState) onNotifiedRefreshResponse(channel string, respEpoch string, items []SharedPollRefreshItem, hub *keyedHub, node *Node) {
+	s.applyRefreshResponse(channel, respEpoch, items, hub, node, "notification")
+}
+
+// onRefreshResponse processes a backend response from the periodic timer poll.
+func (s *sharedPollChannelState) onRefreshResponse(channel string, respEpoch string, items []SharedPollRefreshItem, hub *keyedHub, node *Node) {
+	s.applyRefreshResponse(channel, respEpoch, items, hub, node, "timer")
+}
+
+// applyRefreshResponse is the shared implementation for both notified and
+// timer-driven refresh responses. The two source kinds differ only in the
+// metric label used for instrumentation — all per-item handling (versioned vs
+// versionless change detection, epoch flip, broadcast, removals, prev_data /
+// KeepLatestData delta base capture) is identical.
+func (s *sharedPollChannelState) applyRefreshResponse(channel string, respEpoch string, items []SharedPollRefreshItem, hub *keyedHub, node *Node, source string) {
 	// Versioned channels: detect publisher epoch change before any per-item
 	// processing. A flip resets all per-key state and unsubscribes current
 	// subscribers; the items in this response then repopulate state under
 	// the new epoch via the standard path below.
-	if !s.opts.isVersionless() {
-		if clients := s.flipEpochAndCollectClients(hub, respEpoch); len(clients) > 0 {
-			for _, c := range clients {
-				c.Unsubscribe(channel, unsubscribeInsufficientState)
-			}
-		}
-	}
-
-	type pendingUpdate struct {
-		key      string
-		version  uint64
-		data     []byte
-		prevData []byte
-	}
-
-	updates := make([]pendingUpdate, 0, len(items))
-	var removals []string
-	var changedCount, unchangedCount int
-
-	s.mu.Lock()
-
-	isVersionless := s.opts.isVersionless()
-
-	for _, e := range items {
-		if e.Removed {
-			removals = append(removals, e.Key)
-			continue
-		}
-
-		entry := s.itemIndex[e.Key]
-		if entry == nil {
-			continue
-		}
-
-		if isVersionless && e.Version == 0 {
-			// Versionless backend response: detect changes by content hash.
-			changed := false
-			if s.opts.KeepLatestData && entry.version > 0 {
-				changed = !bytes.Equal(entry.data, e.Data)
-			} else if entry.version > 0 {
-				newHash := xxHash64(e.Data)
-				changed = newHash != entry.dataHash
-				if changed {
-					entry.dataHash = newHash
-				}
-			} else {
-				// First data for this key.
-				changed = true
-				if !s.opts.KeepLatestData {
-					entry.dataHash = xxHash64(e.Data)
-				}
-			}
-			if !changed {
-				unchangedCount++
-				if entry.needsBroadcast && entry.version > 0 {
-					entry.needsBroadcast = false
-					updates = append(updates, pendingUpdate{
-						key: e.Key, version: entry.version, data: e.Data,
-					})
-				}
-				continue
-			}
-			entry.needsBroadcast = false
-			changedCount++
-			s.versionCounter++
-			syntheticVersion := s.versionCounter
-			var prevData []byte
-			if s.opts.KeepLatestData {
-				prevData = entry.data
-				entry.data = e.Data
-			}
-			entry.version = syntheticVersion
-			updates = append(updates, pendingUpdate{
-				key: e.Key, version: syntheticVersion, data: e.Data, prevData: prevData,
-			})
-			continue
-		}
-
-		if e.Version <= entry.version {
-			unchangedCount++
-			if entry.needsBroadcast && entry.version > 0 {
-				entry.needsBroadcast = false
-				updates = append(updates, pendingUpdate{
-					key: e.Key, version: entry.version, data: e.Data,
-				})
-			}
-			continue
-		}
-
-		entry.needsBroadcast = false
-		changedCount++
-		var prevData []byte
-		if s.opts.KeepLatestData {
-			prevData = entry.data
-			entry.data = e.Data
-		}
-		if len(e.PrevData) > 0 && !s.opts.KeepLatestData {
-			prevData = e.PrevData
-		}
-		entry.version = e.Version
-
-		updates = append(updates, pendingUpdate{
-			key: e.Key, version: e.Version, data: e.Data, prevData: prevData,
-		})
-	}
-
-	s.mu.Unlock()
-
-	rc := node.metrics.getSharedPollResultCached("notification", channel)
-	rc.changed.Add(float64(changedCount))
-	rc.unchanged.Add(float64(unchangedCount))
-	rc.removed.Add(float64(len(removals)))
-
-	// Build publications outside the lock.
-	pubs := make([]protocol.Publication, len(updates))
-	broadcasts := make([]pendingBroadcast, 0, len(updates)+len(removals))
-	for i, u := range updates {
-		pubs[i] = protocol.Publication{Key: u.key, Data: u.data, Version: u.version}
-		prep := buildPreparedPollData(&pubs[i], u.prevData)
-		broadcasts = append(broadcasts, pendingBroadcast{key: u.key, version: u.version, pub: &pubs[i], prep: prep})
-	}
-	for _, key := range removals {
-		broadcasts = append(broadcasts, pendingBroadcast{key: key, removal: true})
-	}
-
-	// Fan out outside the lock.
-	for _, b := range broadcasts {
-		if b.removal {
-			hub.broadcastRemoval(channel, b.key)
-		} else {
-			hub.broadcastToKey(channel, b.key, b.version, b.pub, b.prep)
-		}
-	}
-
-	// Clean up removed items from hub and itemIndex.
-	if len(removals) > 0 {
-		s.mu.Lock()
-		for _, key := range removals {
-			hub.removeAllSubscribers(key)
-			delete(s.itemIndex, key)
-		}
-		s.mu.Unlock()
-	}
-}
-
-func (s *sharedPollChannelState) onRefreshResponse(channel string, respEpoch string, items []SharedPollRefreshItem, hub *keyedHub, node *Node) {
-	// Versioned channels: detect publisher epoch change before any per-item
-	// processing. See onNotifiedRefreshResponse for rationale.
 	if !s.opts.isVersionless() {
 		if clients := s.flipEpochAndCollectClients(hub, respEpoch); len(clients) > 0 {
 			for _, c := range clients {
@@ -1646,7 +1527,7 @@ func (s *sharedPollChannelState) onRefreshResponse(channel string, respEpoch str
 
 	s.mu.Unlock()
 
-	rc := node.metrics.getSharedPollResultCached("timer", channel)
+	rc := node.metrics.getSharedPollResultCached(source, channel)
 	rc.changed.Add(float64(changedCount))
 	rc.unchanged.Add(float64(unchangedCount))
 	rc.removed.Add(float64(len(removals)))

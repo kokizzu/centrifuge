@@ -3571,6 +3571,102 @@ func TestMapSubscribe_RecoveryAfterClear(t *testing.T) {
 	require.Equal(t, ErrorUnrecoverablePosition.Code, rwWrapper.replies[0].Error.Code)
 }
 
+// TestMapSubscribe_StateToLive_EpochFlipDuringPagination verifies that a
+// non-recovery STATE→LIVE transition rejects the request with
+// ErrorUnrecoverablePosition when the broker's stream epoch differs from the
+// state-phase epoch the client paginated against. Without the guard the client
+// would merge prior-epoch state with new-epoch live publications and silently
+// orphan any keys not republished in the new epoch.
+func TestMapSubscribe_StateToLive_EpochFlipDuringPagination(t *testing.T) {
+	node, err := New(Config{
+		LogLevel:   LogLevelTrace,
+		LogHandler: func(entry LogEntry) {},
+		Map: MapConfig{
+			GetMapChannelOptions: func(channel string) MapChannelOptions {
+				return MapChannelOptions{
+					Mode:        MapModeRecoverable,
+					KeyTTL:      60 * time.Second,
+					MinPageSize: 1,
+				}
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	broker, err := NewMemoryMapBroker(node, MemoryMapBrokerConfig{})
+	require.NoError(t, err)
+	err = broker.RegisterEventHandler(nil)
+	require.NoError(t, err)
+	node.SetMapBroker(broker)
+
+	err = node.Run()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = node.Shutdown(context.Background())
+	})
+
+	channel := "test_state_to_live_epoch_flip"
+	ctx := context.Background()
+
+	// Seed multiple keys so the first state page is not the last.
+	for i := 0; i < 4; i++ {
+		_, err := broker.Publish(ctx, channel, string(rune('a'+i)), MapPublishOptions{
+			Data: []byte(`{"v":"initial"}`),
+		})
+		require.NoError(t, err)
+	}
+
+	node.OnConnect(func(client *Client) {
+		client.OnSubscribe(func(e SubscribeEvent, cb SubscribeCallback) {
+			cb(SubscribeReply{
+				Options: SubscribeOptions{
+					Type: SubscriptionTypeMap,
+				},
+			}, nil)
+		})
+	})
+
+	client := newTestConnectedClientV2(t, node, "user1")
+
+	// First page captures the state-phase epoch and a cursor for the next page.
+	firstPage := subscribeMapClient(t, client, &protocol.SubscribeRequest{
+		Channel: channel,
+		Type:    int32(SubscriptionTypeMap),
+		Phase:   MapPhaseState,
+		Limit:   1,
+	})
+	require.Equal(t, MapPhaseState, firstPage.Phase)
+	require.NotEmpty(t, firstPage.Cursor)
+	require.NotEmpty(t, firstPage.Epoch)
+
+	frozenOffset := firstPage.Offset
+	stateEpoch := firstPage.Epoch
+
+	// Clear the channel between pagination requests so the LIVE transition's
+	// MapStreamRead lands on a freshly-created stream with a different epoch.
+	// We deliberately do NOT republish afterward — that path skips the broker's
+	// own `since.Epoch != stream.Epoch()` check (which only fires on a populated
+	// stream) and exercises the client-side guard we added: a non-empty
+	// state-phase epoch must match the live stream's epoch even when
+	// isRecovery=false.
+	require.NoError(t, broker.Clear(ctx, channel, MapClearOptions{}))
+
+	rwWrapper := testReplyWriterWrapper()
+	err = client.handleSubscribe(&protocol.SubscribeRequest{
+		Channel: channel,
+		Type:    int32(SubscriptionTypeMap),
+		Phase:   MapPhaseState,
+		Limit:   100, // ample so the remaining state fits in one page → state→live transition.
+		Cursor:  firstPage.Cursor,
+		Offset:  frozenOffset,
+		Epoch:   stateEpoch,
+	}, &protocol.Command{Id: 2}, time.Now(), rwWrapper.rw)
+	require.NoError(t, err)
+	require.Len(t, rwWrapper.replies, 1)
+	require.NotNil(t, rwWrapper.replies[0].Error, "state→live with mismatched epoch must error")
+	require.Equal(t, ErrorUnrecoverablePosition.Code, rwWrapper.replies[0].Error.Code)
+}
+
 // TestMapSubscribe_EpochInFirstPublication verifies that the first publication
 // (offset=1) includes epoch on the wire, while subsequent publications do not.
 // This allows the client SDK to learn the channel epoch from the first publication

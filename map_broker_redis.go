@@ -2587,6 +2587,11 @@ func (e *RedisMapBroker) getChannelsForCleanup(ctx context.Context, client rueid
 // cleanupChannel runs the 2-phase cleanup for a single channel:
 // Phase 1: find expired keys and read their state values (read-only Lua)
 // Phase 2: construct removal protobufs in Go (with tags), then batch-remove atomically (Lua)
+//
+// Drains up to maxBatchesPerCall batches per invocation so a single hot channel
+// with a large backlog converges quickly instead of being capped at
+// CleanupBatchSize keys per CleanupInterval. Other channels in the same partition
+// remain unaffected since partition-level fan-out runs independent goroutines.
 func (e *RedisMapBroker) cleanupChannel(ctx context.Context, shard *RedisShard, ch string, cleanupKey string, now int64) error {
 	// Get channel options for this channel.
 	chOpts, err := ResolveAndValidateMapChannelOptions(e.node.config.Map.GetMapChannelOptions, ch)
@@ -2594,53 +2599,62 @@ func (e *RedisMapBroker) cleanupChannel(ctx context.Context, shard *RedisShard, 
 		return err
 	}
 
-	// Phase 1: find expired keys and read their state values.
-	expiredEntries, err := e.findExpiredKeys(ctx, shard, ch, now)
-	if err != nil {
-		return err
-	}
-	if len(expiredEntries) == 0 {
-		return nil
-	}
+	const maxBatchesPerCall = 10
+	for i := 0; i < maxBatchesPerCall; i++ {
+		// Phase 1: find expired keys and read their state values.
+		expiredEntries, err := e.findExpiredKeys(ctx, shard, ch, now)
+		if err != nil {
+			return err
+		}
+		if len(expiredEntries) == 0 {
+			return nil
+		}
 
-	// Phase 2: construct removal protobufs in Go (with tags from state), then batch-remove.
-	removals := make([]cleanupRemovalEntry, 0, len(expiredEntries))
-	for _, entry := range expiredEntries {
-		// Extract tags from the stored publication protobuf.
-		var tags map[string]string
-		if len(entry.stateValue) > 0 {
-			_, _, payload, parseErr := parseStateValue(entry.stateValue)
-			if parseErr == nil && len(payload) > 0 {
-				var pub protocol.Publication
-				if unmarshalErr := pub.UnmarshalVT(payload); unmarshalErr == nil {
-					tags = pub.Tags
+		// Phase 2: construct removal protobufs in Go (with tags from state), then batch-remove.
+		removals := make([]cleanupRemovalEntry, 0, len(expiredEntries))
+		for _, entry := range expiredEntries {
+			// Extract tags from the stored publication protobuf.
+			var tags map[string]string
+			if len(entry.stateValue) > 0 {
+				_, _, payload, parseErr := parseStateValue(entry.stateValue)
+				if parseErr == nil && len(payload) > 0 {
+					var pub protocol.Publication
+					if unmarshalErr := pub.UnmarshalVT(payload); unmarshalErr == nil {
+						tags = pub.Tags
+					}
 				}
+			}
+
+			// Construct removal protobuf with tags.
+			removePub := &protocol.Publication{
+				Key:     entry.key,
+				Removed: true,
+				Time:    now,
+				Tags:    tags,
+			}
+			pubBytes, marshalErr := removePub.MarshalVT()
+			if marshalErr != nil {
+				continue
+			}
+			removals = append(removals, cleanupRemovalEntry{
+				key:         entry.key,
+				payload:     pubBytes,
+				expireScore: entry.expireScore,
+			})
+		}
+
+		if len(removals) > 0 {
+			if err := e.batchRemoveExpired(ctx, shard, ch, cleanupKey, chOpts, removals); err != nil {
+				return err
 			}
 		}
 
-		// Construct removal protobuf with tags.
-		removePub := &protocol.Publication{
-			Key:     entry.key,
-			Removed: true,
-			Time:    now,
-			Tags:    tags,
+		// If we drained less than a full batch, the queue is empty for now.
+		if len(expiredEntries) < e.conf.CleanupBatchSize {
+			return nil
 		}
-		pubBytes, marshalErr := removePub.MarshalVT()
-		if marshalErr != nil {
-			continue
-		}
-		removals = append(removals, cleanupRemovalEntry{
-			key:         entry.key,
-			payload:     pubBytes,
-			expireScore: entry.expireScore,
-		})
 	}
-
-	if len(removals) == 0 {
-		return nil
-	}
-
-	return e.batchRemoveExpired(ctx, shard, ch, cleanupKey, chOpts, removals)
+	return nil
 }
 
 // expiredKeyEntry holds data returned from the find-expired Lua script.
