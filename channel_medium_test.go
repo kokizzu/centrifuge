@@ -50,6 +50,7 @@ func (m *mockNode) mapStreamTop(ch string) (StreamPosition, error) {
 }
 
 func TestChannelMediumHandlePublication(t *testing.T) {
+	t.Parallel()
 	var testCases = []struct {
 		numPublications int
 		options         ChannelMediumOptions
@@ -118,6 +119,7 @@ func TestChannelMediumHandlePublication(t *testing.T) {
 }
 
 func TestChannelMediumInsufficientState(t *testing.T) {
+	t.Parallel()
 	options := ChannelMediumOptions{
 		enableQueue:           true,
 		KeepLatestPublication: true,
@@ -143,6 +145,7 @@ func TestChannelMediumInsufficientState(t *testing.T) {
 }
 
 func TestChannelMediumPositionSync(t *testing.T) {
+	t.Parallel()
 	options := ChannelMediumOptions{
 		SharedPositionSync: true,
 	}
@@ -156,12 +159,8 @@ func TestChannelMediumPositionSync(t *testing.T) {
 			return StreamPosition{}, nil
 		},
 	})
-	originalGetter := channelMediumTimeNow
-	channelMediumTimeNow = func() time.Time {
-		return time.Now().Add(time.Hour)
-	}
+	medium.nowFn = func() time.Time { return time.Now().Add(time.Hour) }
 	medium.CheckPosition(time.Second, StreamPosition{Offset: 1, Epoch: "test"}, time.Second)
-	channelMediumTimeNow = originalGetter
 	select {
 	case <-doneCh:
 	case <-time.After(5 * time.Second):
@@ -170,6 +169,7 @@ func TestChannelMediumPositionSync(t *testing.T) {
 }
 
 func TestChannelMediumPositionSyncRetry(t *testing.T) {
+	t.Parallel()
 	options := ChannelMediumOptions{
 		SharedPositionSync: true,
 	}
@@ -188,12 +188,8 @@ func TestChannelMediumPositionSyncRetry(t *testing.T) {
 			return StreamPosition{}, nil
 		},
 	})
-	originalGetter := channelMediumTimeNow
-	channelMediumTimeNow = func() time.Time {
-		return time.Now().Add(time.Hour)
-	}
+	medium.nowFn = func() time.Time { return time.Now().Add(time.Hour) }
 	medium.CheckPosition(time.Second, StreamPosition{Offset: 1, Epoch: "test"}, time.Second)
-	channelMediumTimeNow = originalGetter
 	select {
 	case <-doneCh:
 	case <-time.After(5 * time.Second):
@@ -202,6 +198,7 @@ func TestChannelMediumPositionSyncRetry(t *testing.T) {
 }
 
 func TestChannelMediumPositionSyncMap(t *testing.T) {
+	t.Parallel()
 	// Verify that SharedPositionSync for map channels calls mapStreamTop (not streamTop).
 	options := ChannelMediumOptions{
 		SharedPositionSync: true,
@@ -221,14 +218,9 @@ func TestChannelMediumPositionSyncMap(t *testing.T) {
 		},
 	})
 	medium.isMap = true
-
-	originalGetter := channelMediumTimeNow
-	channelMediumTimeNow = func() time.Time {
-		return time.Now().Add(time.Hour)
-	}
+	medium.nowFn = func() time.Time { return time.Now().Add(time.Hour) }
 	// Position matches — should return true.
 	valid := medium.CheckPosition(time.Second, StreamPosition{Offset: 5, Epoch: "abc"}, time.Second)
-	channelMediumTimeNow = originalGetter
 	require.True(t, valid)
 	select {
 	case <-mapStreamTopCalled:
@@ -238,6 +230,7 @@ func TestChannelMediumPositionSyncMap(t *testing.T) {
 }
 
 func TestChannelMediumPositionSyncMapMismatch(t *testing.T) {
+	t.Parallel()
 	// Verify that SharedPositionSync for map channels detects position mismatch.
 	options := ChannelMediumOptions{
 		SharedPositionSync: true,
@@ -259,14 +252,9 @@ func TestChannelMediumPositionSyncMapMismatch(t *testing.T) {
 		},
 	})
 	medium.isMap = true
-
-	originalGetter := channelMediumTimeNow
-	channelMediumTimeNow = func() time.Time {
-		return time.Now().Add(time.Hour)
-	}
+	medium.nowFn = func() time.Time { return time.Now().Add(time.Hour) }
 	// Client has stale position — should return false.
 	valid := medium.CheckPosition(time.Second, StreamPosition{Offset: 5, Epoch: "xyz"}, time.Second)
-	channelMediumTimeNow = originalGetter
 	require.False(t, valid)
 	select {
 	case <-insufficientCh:
@@ -276,6 +264,7 @@ func TestChannelMediumPositionSyncMapMismatch(t *testing.T) {
 }
 
 func TestChannelMediumNoLocalPrevPubForMapSubs(t *testing.T) {
+	t.Parallel()
 	// Test that channel medium does NOT provide localPrevPub for map publications
 	// (pub.Key != ""). Map keys are independent streams — a single latestPublication
 	// can't serve as a correct delta base across different keys. Only non-map
@@ -482,21 +471,33 @@ func TestChannelMediumWithBroadcastDelayCoalesces(t *testing.T) {
 		)
 	}
 
-	deadline := time.After(2 * time.Second)
+	// Wait for first delivery — the 50ms broadcastDelay can stretch under -race
+	// load, so use Eventually rather than a fixed inner timeout that flakes.
 	var received []*Publication
-loop:
+	require.Eventually(t, func() bool {
+		select {
+		case p := <-delivered:
+			received = append(received, p)
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond, "expected at least one coalesced delivery")
+
+	// Drain any follow-ups arriving shortly after the first delivery. Use a
+	// long enough quiet window that all coalesced publications have a chance
+	// to arrive even under -race contention.
+	drainTimeout := time.After(500 * time.Millisecond)
+drain:
 	for {
 		select {
 		case p := <-delivered:
 			received = append(received, p)
-			// After receiving the first batch, peek for follow-ups.
-		case <-time.After(150 * time.Millisecond):
-			break loop
-		case <-deadline:
-			break loop
+		case <-drainTimeout:
+			break drain
 		}
 	}
-	require.NotEmpty(t, received)
+
 	// Coalescing: at minimum we should receive far fewer than 5 publications.
 	require.Less(t, len(received), 5)
 	// The last delivered publication must be the highest offset queued.
